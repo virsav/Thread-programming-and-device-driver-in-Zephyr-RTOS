@@ -1,0 +1,751 @@
+diff -Naur ./old_zephyr/drivers/sensor/CMakeLists.txt ./zephyr/drivers/sensor/CMakeLists.txt
+--- ./old_zephyr/drivers/sensor/CMakeLists.txt	2021-03-05 21:07:39.467728962 -0800
++++ ./zephyr/drivers/sensor/CMakeLists.txt	2021-02-27 12:17:53.328428510 -0800
+@@ -17,6 +17,7 @@
+ add_subdirectory_ifdef(CONFIG_FXAS21002		fxas21002)
+ add_subdirectory_ifdef(CONFIG_FXOS8700		fxos8700)
+ add_subdirectory(grove)
++add_subdirectory_ifdef(CONFIG_HCSR04		hc-sr04)
+ add_subdirectory_ifdef(CONFIG_HDC1008		hdc1008)
+ add_subdirectory_ifdef(CONFIG_HMC5883L		hmc5883l)
+ add_subdirectory_ifdef(CONFIG_HP206C		hp206c)
+diff -Naur ./old_zephyr/drivers/sensor/hc-sr04/CMakeLists.txt ./zephyr/drivers/sensor/hc-sr04/CMakeLists.txt
+--- ./old_zephyr/drivers/sensor/hc-sr04/CMakeLists.txt	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/drivers/sensor/hc-sr04/CMakeLists.txt	2021-02-24 19:43:15.118417883 -0800
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++
++zephyr_library()
++
++zephyr_library_sources_ifdef(CONFIG_HCSR04 hcsr04.c)
+diff -Naur ./old_zephyr/drivers/sensor/hc-sr04/hcsr04.c ./zephyr/drivers/sensor/hc-sr04/hcsr04.c
+--- ./old_zephyr/drivers/sensor/hc-sr04/hcsr04.c	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/drivers/sensor/hc-sr04/hcsr04.c	2021-03-05 21:04:42.416693843 -0800
+@@ -0,0 +1,310 @@
++/*
++ * Copyright (c) 2016 Intel Corporation
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include "hcsr04.h"
++
++#define LOG_LEVEL CONFIG_SENSOR_LOG_LEVEL
++LOG_MODULE_REGISTER(HCSR04);
++
++#define EDGE_FALLING    (GPIO_INT_EDGE | GPIO_INT_ACTIVE_LOW)
++#define EDGE_RISING		(GPIO_INT_EDGE | GPIO_INT_ACTIVE_HIGH)
++
++//#define DEBUG 
++#if defined(DEBUG) 
++	#define DPRINTK(fmt, args...) printk("DEBUG: %s():%d: " fmt, \
++   		 __func__, __LINE__, ##args)
++#else
++ 	#define DPRINTK(fmt, args...) /* do nothing if not defined*/
++#endif
++
++/* RDTSC inline function for timesatmp */
++static inline uint64_t __attribute__((__always_inline__))
++rdtsc(void)
++{
++    uint32_t a, d;
++    __asm __volatile("rdtsc" : "=a" (a), "=d" (d));
++    return ((uint64_t) a) | (((uint64_t) d) << 32);
++}
++
++/* pinmux device pointer to set pins */
++static struct device *pinmux;  
++
++/* Array for conversion of IO pin to corresponding GPIO pin in zephyr */
++const int io_to_gpio[14] = {3, 4, 5, 6, 0, 8, 9, 0, 0, 0, 2, 0, 7, 0};
++// 0 value refers invalid GPIO pin and the respective check is done in gpio_init()
++
++/* Callback function for interrupt */
++static void hcsr04_gpio_callback(struct device *dev, struct gpio_callback *cb, u32_t pins)
++{
++	//Get Driver data struct from callback struct pointer
++	struct hcsr04_data *drv_data = CONTAINER_OF(cb, struct hcsr04_data, gpio_cb);
++
++	drv_data->status = 1;		//Set device as busy -- To be cleared when sample recorded
++
++	//Getting the device buffer pointer from device data
++	struct dev_buffer *int_cb_data = drv_data->buff_data;
++
++	int ret, val;
++
++	//Reading the echo pin to clear the interrupt and check which edge triggered it
++	ret = gpio_pin_read(drv_data->gpiob, io_to_gpio[drv_data->echo_pin], &val);
++
++	//If pin read = 1 then high pulse has started
++	if(val == 1) {
++
++		int_cb_data->start_time = rdtsc();
++
++		//Configure the echo pin to falling edge to record the sample measurement
++		ret = gpio_pin_configure(drv_data->gpiob, io_to_gpio[drv_data->echo_pin], GPIO_DIR_IN | GPIO_INT | EDGE_FALLING);
++		if(ret < 0) {
++			DPRINTK("Error setting falling edge for pin no.%d\n", drv_data->echo_pin);
++			return;
++		}
++	}
++	else if(val == 0) {		//If pin read = 0 then high pulse stopped and sample recording complete
++
++		int_cb_data->stop_time = rdtsc();
++
++		//Calculate pulse width to measure distance using formula (microsecond/58 = centimeters)
++		int_cb_data->distance_cm = ((int_cb_data->stop_time - int_cb_data->start_time)/(400*58));
++
++		drv_data->status = 0;			//Clear busy state of device
++		k_sem_give(&drv_data->dev_sem); //Give semaphore to start channel get and accept sample		
++
++		//Clear start and stop time fields for device buffer
++		int_cb_data->start_time = int_cb_data->stop_time = 0;
++
++		DPRINTK("Distance is %d from device\n",int_cb_data->distance_cm);
++
++		//Configure the echo pin back to rising edge interrupt
++		ret = gpio_pin_configure(drv_data->gpiob, io_to_gpio[drv_data->echo_pin], GPIO_DIR_IN | GPIO_INT | EDGE_RISING);
++		if(ret < 0) {
++			DPRINTK("error setting rising edge for pin no.%d\n", drv_data->echo_pin);
++			return;
++		}
++	}
++}
++
++/* sensor_sample_fetch function to fetch a measurement from the sensor */
++static int hcsr04_sample_fetch(struct device *dev, enum sensor_channel chan)
++{
++	struct hcsr04_data *drv_data = dev->driver_data;
++
++	//Check if device already taking a sample measurement and return BUSY
++	if(drv_data->status) {
++		DPRINTK("hcsr04_sample_fetch aborted - DRIVER %s BUSY\n", dev->config->name);
++		return -1;
++	}
++
++	__ASSERT_NO_MSG(chan == SENSOR_CHAN_ALL);
++
++	//Create a rising edge by setting trigger pin to 0 and then 1
++	int ret = gpio_pin_write(drv_data->gpiob, io_to_gpio[drv_data->trigger_pin], 0);
++	if(ret < 0) {
++		DPRINTK("Error setting trigger pin to 0\n");
++	}
++	ret = gpio_pin_write(drv_data->gpiob, io_to_gpio[drv_data->trigger_pin], 1);
++	if(ret < 0) {
++		DPRINTK("Error sending trigger to 1\n");
++	}
++
++	//Wait more than 10uS as only 10uS pulse is to be supplied to trigger pin to start ranging
++	k_sleep(10);
++
++	//Set trigger pin back to 0
++	ret = gpio_pin_write(drv_data->gpiob, io_to_gpio[drv_data->trigger_pin], 0);
++	if(ret < 0) {
++		DPRINTK("Error sending trigger pin to 0\n");
++	}	
++
++	return 0;
++}
++
++/* sensor_channel_get function to get the recorded measurement from the sensor */
++static int hcsr04_channel_get(struct device *dev, enum sensor_channel chan, struct sensor_value *val)
++{
++	struct hcsr04_data *drv_data = dev->driver_data;
++
++	//Check if device busy and distance not measured (buffer empty)
++	if(drv_data->status && !drv_data->buff_data->distance_cm) {
++
++		//Block the call till new measurement arrives
++		if(k_sem_take(&drv_data->dev_sem, K_MSEC(drv_data->timeout)) != 0) {
++			DPRINTK("Timed out for %d\n", drv_data->timeout);
++			return -1;
++		}//Get measurement when unblocked and clear buffer
++		else{
++			val->val1 = drv_data->buff_data->distance_cm;
++			if(val->val1 == 0) {
++				DPRINTK("Distance measured 0 with driver status %d \n", drv_data->status);
++			}
++			drv_data->buff_data->distance_cm = 0;
++		}
++	}//Check if device not busy but buffer still empty then retrigger a measurement
++	else if(!drv_data->status && !drv_data->buff_data->distance_cm) {
++
++		DPRINTK("Re-triggering\n");
++		hcsr04_sample_fetch(dev, SENSOR_CHAN_ALL);
++
++		//Block the call till new measurement arrives
++		if(k_sem_take(&drv_data->dev_sem, K_MSEC(drv_data->timeout)) != 0) {
++			DPRINTK("Timed out for %d\n", drv_data->timeout);
++			return -1;
++		}//Get measurement when unblocked and clear buffer
++		else {
++			val->val1 = drv_data->buff_data->distance_cm;
++			if(val->val1 == 0) {
++				DPRINTK("Distance measured 0 with driver status %d \n", drv_data->status);
++			}
++			drv_data->buff_data->distance_cm = 0;
++		}
++	} //Else Return sample recorded and clear buffer
++	else {
++		val->val1 = drv_data->buff_data->distance_cm;
++		if(val->val1 == 0) {
++			DPRINTK("Distance measured 0 with driver status %d \n", drv_data->status);
++		}
++		drv_data->buff_data->distance_cm = 0;
++	}
++
++	return 0;
++}
++
++/* Function to Initialise GPIO pins of sensor device */
++static int gpio_init(int dev0, struct hcsr04_data *hcsr_data) 
++{
++	int ret;
++
++	//Binding for pinmux
++	pinmux=device_get_binding(CONFIG_PINMUX_NAME);
++
++	struct galileo_data *dev = pinmux->driver_data;
++	
++    hcsr_data->gpiob=dev->gpio_dw; //retrieving gpio_dw driver struct from pinmux driver
++						// Alternatively, gpiob = device_get_binding(PORT);
++	if (!(hcsr_data->gpiob)) {
++		DPRINTK("error\n");
++		return -EIO;
++	}
++
++	//Set the trigger and echo device pins
++	if(!dev0) {
++		hcsr_data->trigger_pin = CONFIG_HCSR04_0_TRIG_PIN;		
++		hcsr_data->echo_pin = CONFIG_HCSR04_0_ECHO_PIN;
++		DPRINTK("Device 0 configured, t=%d , e=%d\n", hcsr_data->trigger_pin, hcsr_data->echo_pin);
++	} else {
++		hcsr_data->trigger_pin = CONFIG_HCSR04_1_TRIG_PIN;
++		hcsr_data->echo_pin = CONFIG_HCSR04_1_ECHO_PIN;
++		DPRINTK("Device 1 configured, t=%d , e=%d\n", hcsr_data->trigger_pin, hcsr_data->echo_pin);
++	}
++
++	//Check if GPIO pins are valid 
++	if((2 > io_to_gpio[hcsr_data->trigger_pin]) || (io_to_gpio[hcsr_data->trigger_pin] > 9) ||
++		(2 > io_to_gpio[hcsr_data->echo_pin]) || (io_to_gpio[hcsr_data->echo_pin] > 9)){
++		DPRINTK("Invalid GPIO pin numbers");
++		return -EIO;
++	}
++
++	//Set echo and trigger pins
++	ret=pinmux_pin_set(pinmux, hcsr_data->trigger_pin, PINMUX_FUNC_A); //trigger pin
++	if(ret<0){
++		DPRINTK("error setting trigger pin\n");
++		return ret;
++	}
++	ret=pinmux_pin_set(pinmux, hcsr_data->echo_pin, PINMUX_FUNC_B); //echo pin
++	if(ret<0){
++		DPRINTK("error setting echo pin\n");
++		return ret;
++	}
++
++	//Configure echo and trigger pins
++	ret = gpio_pin_configure(hcsr_data->gpiob, io_to_gpio[hcsr_data->trigger_pin], GPIO_DIR_OUT);
++	if(ret < 0) {
++		DPRINTK("error setting pin for interrupt trigger pin\n");
++		return ret;
++	}
++	ret = gpio_pin_configure(hcsr_data->gpiob, io_to_gpio[hcsr_data->echo_pin], GPIO_DIR_IN | GPIO_INT | EDGE_RISING);
++	if(ret < 0) {
++		DPRINTK("error setting pin for interrupt echo pin\n");
++		return ret;
++	}
++
++	struct gpio_callback gpio_cb;
++	hcsr_data->gpio_cb = gpio_cb;
++
++	//Set Callback for interrupt
++	gpio_init_callback(&hcsr_data->gpio_cb, hcsr04_gpio_callback, BIT(io_to_gpio[hcsr_data->echo_pin]));
++	ret=gpio_add_callback(hcsr_data->gpiob, &hcsr_data->gpio_cb);
++	if(ret<0){ 
++		DPRINTK("error adding callback\n");
++		return ret;
++	}
++	ret = gpio_pin_enable_callback(hcsr_data->gpiob, io_to_gpio[hcsr_data->echo_pin]);
++	if(ret < 0) {
++		DPRINTK("error in gpio_pin_enable_callback\n");
++		return ret;
++	}
++
++	//Set trigger pin to 0 initially
++	ret = gpio_pin_write(hcsr_data->gpiob, io_to_gpio[hcsr_data->trigger_pin], 0);
++	if(ret < 0) {
++		DPRINTK("Error setting trigger pin to 0\n");
++	}
++
++	DPRINTK("GPIO init done\n");
++
++	return 0;
++
++}
++
++/* HCSR04 sensor driver API struct */
++static const struct sensor_driver_api hcsr04_driver_api = {
++	.sample_fetch = hcsr04_sample_fetch,
++	.channel_get = hcsr04_channel_get,
++};
++
++/* Function to initialise HCSR04 Device */
++int hcsr04_init(struct device *dev)
++{
++	struct hcsr04_data *drv_data = dev->driver_data;
++
++	//Check which deivce called init
++	int dev0 = strcmp(dev->config->name, CONFIG_HCSR04_00);
++
++	DPRINTK("Initialising Device no.%d - %s\n", dev0, dev->config->name);
++
++	//Initialize GPIO pins for device
++	int ret = gpio_init(dev0, drv_data);
++	if(ret) {
++		DPRINTK("Error initializing GPIO\n");
++		return -EIO;
++	}
++
++	//Clear device status and buffer
++	drv_data->status = 0;
++	drv_data->buff_data->start_time=0;
++	drv_data->buff_data->stop_time=0;
++	drv_data->buff_data->distance_cm=0;
++
++	//Set timeout for device
++	drv_data->timeout = HCSR04_TIMEOUT;	
++
++	//Start sem as unavailable
++	k_sem_init(&drv_data->dev_sem, 0, 1);
++
++	return 0;
++}
++
++/* Per device struct */
++static struct hcsr04_data hcsr04_0_driver, hcsr04_1_driver;
++
++DEVICE_AND_API_INIT(HCSR04_0, CONFIG_HCSR04_00, hcsr04_init, &hcsr04_0_driver,
++		    NULL, POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,
++		    &hcsr04_driver_api);
++
++DEVICE_AND_API_INIT(HCSR04_1, CONFIG_HCSR04_01, hcsr04_init, &hcsr04_1_driver,
++		    NULL, POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,
++		    &hcsr04_driver_api);
+diff -Naur ./old_zephyr/drivers/sensor/hc-sr04/hcsr04.h ./zephyr/drivers/sensor/hc-sr04/hcsr04.h
+--- ./old_zephyr/drivers/sensor/hc-sr04/hcsr04.h	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/drivers/sensor/hc-sr04/hcsr04.h	2021-03-04 20:50:12.829002890 -0800
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (c) 2016 Intel Corporation
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_DRIVERS_SENSOR_HCSR04_H_
++#define ZEPHYR_DRIVERS_SENSOR_HCSR04_H_
++
++#include <i2c.h>
++#include <init.h>
++#include <sensor.h>
++#include <logging/log.h>
++#include <device.h>
++#include <gpio.h>
++#include <misc/util.h>
++#include <zephyr/types.h>
++#include <pinmux.h>
++#include <string.h>
++#include <kernel.h>
++#include <asm_inline_gcc.h>
++#include "../boards/x86/galileo/board.h"
++#include "../boards/x86/galileo/pinmux_galileo.h"
++#include "../drivers/gpio/gpio_dw_registers.h"
++#include "../drivers/gpio/gpio_dw.h"
++
++//HCSR Timeout to be set for devices for recording measurement
++#define HCSR04_TIMEOUT 1000
++
++/* Internal Device Buffer */
++struct dev_buffer {
++	u64_t start_time;
++	u64_t stop_time;
++	u32_t distance_cm;
++};
++
++/* HCSR sensor data struct */
++struct hcsr04_data {
++
++	struct device *gpiob;
++	int trigger_pin;
++	int echo_pin;
++	u8_t status;
++	struct k_sem dev_sem;
++	struct dev_buffer *buff_data;
++	u16_t timeout;
++	struct gpio_callback gpio_cb;
++};
++
++#endif /* __SENSOR_HCSR04__ */
+diff -Naur ./old_zephyr/drivers/sensor/hc-sr04/Kconfig ./zephyr/drivers/sensor/hc-sr04/Kconfig
+--- ./old_zephyr/drivers/sensor/hc-sr04/Kconfig	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/drivers/sensor/hc-sr04/Kconfig	2021-03-05 00:07:02.664947299 -0800
+@@ -0,0 +1,45 @@
++# Kconfig - HCSR04 Ultrasnic ranging device configuration options
++
++#
++# Copyright (c) 2016 Intel Corporation
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++
++menuconfig HCSR04
++	bool "HCSR04 Ultrasonic Sensor"
++	depends on GPIO
++	help
++	  Enable driver for HCSR04 ultrasonic distance sensors.
++
++if HCSR04
++
++config HCSR04_00
++	string "Driver 0 name"
++	default "HCSR0"
++	help
++	  Device name with which the HCSR04 sensor 0 is identified.
++
++config HCSR04_01
++	string "Driver 1 name"
++	default "HCSR1"
++	help
++	  Device name with which the HCSR04 sensor 1 is identified.
++
++config HCSR04_0_TRIG_PIN
++	int "Trigger pin IO number"
++	default 1
++
++config HCSR04_0_ECHO_PIN
++	int "Trigger pin IO number"
++	default 3
++
++config HCSR04_1_TRIG_PIN
++	int "Trigger pin IO number"
++	default 10
++
++config HCSR04_1_ECHO_PIN
++	int "Trigger pin IO number"
++	default 12
++
++endif #HCSR04
+diff -Naur ./old_zephyr/drivers/sensor/Kconfig ./zephyr/drivers/sensor/Kconfig
+--- ./old_zephyr/drivers/sensor/Kconfig	2021-03-05 21:07:29.911565145 -0800
++++ ./zephyr/drivers/sensor/Kconfig	2021-02-27 12:17:43.080093179 -0800
+@@ -59,6 +59,8 @@
+ 
+ source "drivers/sensor/grove/Kconfig"
+ 
++source "drivers/sensor/hc-sr04/Kconfig"
++
+ source "drivers/sensor/hdc1008/Kconfig"
+ 
+ source "drivers/sensor/hmc5883l/Kconfig"
+diff -Naur ./old_zephyr/samples/HCSR_app/CMakeLists.txt ./zephyr/samples/HCSR_app/CMakeLists.txt
+--- ./old_zephyr/samples/HCSR_app/CMakeLists.txt	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/samples/HCSR_app/CMakeLists.txt	2021-02-24 19:23:15.453904714 -0800
+@@ -0,0 +1,9 @@
++set(IS_TEST 1)
++
++cmake_minimum_required(VERSION 3.13.1)
++include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)
++project(HCSR_app)
++
++FILE(GLOB app_sources src/main.c)
++target_sources(app PRIVATE ${app_sources})
++target_compile_options(app PRIVATE -Wall)
+diff -Naur ./old_zephyr/samples/HCSR_app/prj.conf ./zephyr/samples/HCSR_app/prj.conf
+--- ./old_zephyr/samples/HCSR_app/prj.conf	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/samples/HCSR_app/prj.conf	2021-02-27 00:46:06.934197349 -0800
+@@ -0,0 +1,21 @@
++CONFIG_STDOUT_CONSOLE=y
++CONFIG_SENSOR=y
++CONFIG_HCSR04=y
++CONFIG_I2C=y
++CONFIG_FLOAT=y
++CONFIG_NEWLIB_LIBC=y
++CONFIG_NEWLIB_LIBC_FLOAT_PRINTF=y
++CONFIG_ETH_DW=n
++CONFIG_ETH_DW_0=n
++CONFIG_PRINTK=y
++CONFIG_SHELL=y
++CONFIG_KERNEL_SHELL=y
++CONFIG_THREAD_MONITOR=y
++CONFIG_INIT_STACKS=y
++CONFIG_THREAD_NAME=y
++CONFIG_DEVICE_SHELL=y
++CONFIG_BOOT_BANNER=n
++CONFIG_LOG=y
++CONFIG_OBJECT_TRACING=y
++CONFIG_POSIX_API=y
++CONFIG_PCI_ENUMERATION=y
+diff -Naur ./old_zephyr/samples/HCSR_app/runall ./zephyr/samples/HCSR_app/runall
+--- ./old_zephyr/samples/HCSR_app/runall	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/samples/HCSR_app/runall	2021-03-03 13:40:21.354443049 -0800
+@@ -0,0 +1,8 @@
++rm -r zephyr.strip
++rm -r build
++mkdir build
++cd build
++cmake -DBOARD=galileo ..
++make
++cd zephyr
++cp zephyr.strip ../..
+\ No newline at end of file
+diff -Naur ./old_zephyr/samples/HCSR_app/src/main.c ./zephyr/samples/HCSR_app/src/main.c
+--- ./old_zephyr/samples/HCSR_app/src/main.c	1969-12-31 16:00:00.000000000 -0800
++++ ./zephyr/samples/HCSR_app/src/main.c	2021-03-05 21:00:31.780397276 -0800
+@@ -0,0 +1,247 @@
++/*
++ * Copyright (c) 2016 Open-RnD Sp. z o.o.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <logging/log.h>
++#include <kernel.h>
++#include <asm_inline_gcc.h>
++#include <posix/time.h>
++#include <zephyr.h>
++#include <device.h>
++#include <gpio.h>
++#include <pwm.h>
++#include <sensor.h>
++#include <init.h>
++#include <stdio.h>
++#include <misc/util.h>
++#include <misc/printk.h>
++#include <shell/shell.h>
++#include <shell/shell_uart.h>
++#include <version.h>
++#include <pinmux.h>
++#include <zephyr/types.h>
++#include "../boards/x86/galileo/board.h"
++#include "../boards/x86/galileo/pinmux_galileo.h"
++#include "../drivers/gpio/gpio_dw_registers.h"
++#include "../drivers/gpio/gpio_dw.h"
++#include <stdlib.h>
++
++//#define DEBUG 
++
++#if defined(DEBUG) 
++	#define DPRINTK(fmt, args...) printk("DEBUG: %s():%d: " fmt, \
++   		 __func__, __LINE__, ##args)
++#else
++ 	#define DPRINTK(fmt, args...) /* do nothing if not defined*/
++#endif
++
++#define EDGE_FALLING    (GPIO_INT_EDGE | GPIO_INT_ACTIVE_LOW)
++#define EDGE_RISING		(GPIO_INT_EDGE | GPIO_INT_ACTIVE_HIGH)
++
++/* change this to enable pull-up/pull-down */
++#define PULL_UP 0
++
++/* Sleep time */
++#define SLEEP_TIME	1000
++
++/* Struct to store the measurement readings */
++struct dev_readings {
++	u64_t elapse_time;		//Elapsed time since the start of application till when sample was recorded
++	const char *name;					//Device name
++	u32_t dist_cm;						//Measurement distance recorded for the sample
++};
++
++/* Sensor device pointer */
++struct device *sensor_dev0, *sensor_dev1;
++
++//Max p value is 256, buffer size 512 to accumulate max samples when both devices enabled
++struct dev_readings distance_buffer[512]; 
++struct sensor_value temp_dist[512];
++
++/* Time reference of application start and when each measurement recorded */
++static u64_t elapsed_start, elapsed_stop;
++
++/* RDTSC inline function for timesatmp */
++static inline uint64_t __attribute__((__always_inline__))
++rdtsc(void)
++{
++    uint32_t a, d;
++    __asm __volatile("rdtsc" : "=a" (a), "=d" (d));
++    return ((uint64_t) a) | (((uint64_t) d) << 32);
++}
++
++/* 'hcsr select n' function to select the device to be enabled */
++static int select_device(const struct shell *shell, size_t argc, char **argv) {
++
++	ARG_UNUSED(argc);
++	
++	int select_dev_num = atoi(argv[1]);
++
++	if(select_dev_num == 0) {
++	 	sensor_dev0 = NULL;	
++	 	sensor_dev1 = NULL;	
++	 	shell_print(shell,"All Devices are now disabled\n");
++	} 
++	else if(select_dev_num == 1){
++	 	sensor_dev0 = device_get_binding(CONFIG_HCSR04_00);	
++	 	sensor_dev1 = NULL;	
++	 	shell_print(shell,"Device enabled is %s\n", sensor_dev0->config->name);		
++	}
++	else if(select_dev_num == 2){
++	 	sensor_dev0 = NULL;	
++	 	sensor_dev1 = device_get_binding(CONFIG_HCSR04_01);
++	 	shell_print(shell,"Device enabled is %s\n", sensor_dev1->config->name);					
++	}
++	else if(select_dev_num == 3){
++	 	sensor_dev0 = device_get_binding(CONFIG_HCSR04_00);	
++	 	sensor_dev1 = device_get_binding(CONFIG_HCSR04_01);	
++	 	shell_print(shell,"Devices enabled are %s and %s\n", sensor_dev0->config->name, sensor_dev1->config->name);							
++	}
++	else{
++		shell_print(shell,"Number entered to select device should be between 0 to 3\n");
++	}
++	return 0;
++}
++
++/* 'hcsr start p' function to start measuremrents for p samples for all the devices enabled */
++static int collect_measurements(const struct shell *shell, size_t argc, char **argv) {
++
++	ARG_UNUSED(argc);
++
++	//Check if any device is enabled
++	if(sensor_dev0 || sensor_dev1){
++
++		int num = atoi(argv[1]);
++		DPRINTK("Sample fetch %d\n", num);
++		int i = 0;
++
++		//When both the devices are enabled the number of measurements are doubled 
++		//as p readings are to be taken for each device
++		if(sensor_dev0 && sensor_dev1){
++			num = num*2;
++		}
++
++		while(i < num) {
++
++			//Check if device 0 enabled
++			if(sensor_dev0){
++
++				//Initiate sample_fetch and continue if successful
++				if (sensor_sample_fetch(sensor_dev0) < 0) {
++					DPRINTK("Sensor sample update error\n");
++					return -1;
++				}
++
++				//Initiate channel_get and continue if successful
++				if (sensor_channel_get(sensor_dev0, SENSOR_CHAN_ALL, &temp_dist[i]) < 0) {
++					DPRINTK("HCSR04 timeout\n");
++					return -1;
++				}
++				elapsed_stop = rdtsc();
++				shell_print(shell,"%s Channel get distance %d cms\n", sensor_dev0->config->name, temp_dist[i].val1);
++
++				//Update all entries in the buffer for recorded measurement
++				distance_buffer[i].dist_cm = temp_dist[i].val1;
++				temp_dist[i].val1 = 0;
++				distance_buffer[i].name = sensor_dev0->config->name;
++				distance_buffer[i].elapse_time = ((elapsed_stop - elapsed_start)/(400*1000));
++				i++;
++				k_sleep(500);	//0.5 sec delay between sample measurement
++			}
++
++			//Check if device 1 enabled
++			if(sensor_dev1){
++
++				//Initiate sample_fetch and continue if successful
++				if (sensor_sample_fetch(sensor_dev1) < 0) {
++					DPRINTK("Sensor sample update error\n");
++					return -1;
++				}
++				
++				//Initiate channel_get and continue if successful
++				if (sensor_channel_get(sensor_dev1, SENSOR_CHAN_ALL, &temp_dist[i]) < 0) {
++					DPRINTK("HCSR04 timeout\n");
++					return -1;
++				}
++				elapsed_stop = rdtsc();
++				shell_print(shell,"%s Channel get distance %d cms\n", sensor_dev1->config->name, temp_dist[i].val1);
++
++				//Update all entries in the buffer for recorded measurement
++				distance_buffer[i].dist_cm = temp_dist[i].val1;
++				temp_dist[i].val1 = 0;
++				distance_buffer[i].name = sensor_dev1->config->name;
++				distance_buffer[i].elapse_time = ((elapsed_stop - elapsed_start)/(400*1000));
++				i++;
++				k_sleep(500);	//0.5 sec delay between sample measurement
++			}
++		}
++	}
++	else{
++		shell_print(shell,"No measurements initiated, all Devices are disabled\n");
++	}
++	return 0;
++}
++
++static int dump_readings(const struct shell *shell, size_t argc, char **argv) {
++
++	ARG_UNUSED(argc);
++
++	int p1 = atoi(argv[1]);
++	int p2 = atoi(argv[2]);
++
++	//Printing start time to show a reference time when application was started
++	shell_print(shell,"Application start time = %llu ms\n", (elapsed_start/(400*1000)));
++
++	//Check if values of p1 and p2 are valid
++	if(p2 >= p1){
++		for(int i = p1-1; i <= p2-1; i++) {
++			shell_print(shell,"Device %s Elapsed time %llu ms:\tValue %d cms\n", distance_buffer[i].name, distance_buffer[i].elapse_time, distance_buffer[i].dist_cm);
++		}
++	}
++	else{
++			shell_print(shell,"Value of P1 should be less than or equal to P2\n");
++	}
++	return 0;
++}
++
++static int clear_buffer(const struct shell *shell, size_t argc, char **argv){
++
++	ARG_UNUSED(argc);
++	ARG_UNUSED(argv);
++
++	//Clear all entries in buffer
++	for(int i = 0; i < 512; i++) {
++		distance_buffer[i].dist_cm = 0;
++		distance_buffer[i].elapse_time = 0;
++		distance_buffer[i].name = NULL;
++	}
++
++	shell_print(shell,"Buffer cleared!\n");
++
++	return 0;
++}
++
++/* Register Shell Command 'hcsr' and its sub-commands */
++SHELL_STATIC_SUBCMD_SET_CREATE(sub_hcsr,
++	SHELL_CMD_ARG(select, NULL, "Command to select HCSR Sensor.", select_device, 2, 0),
++	SHELL_CMD_ARG(start, NULL, "Command to start collecting measurements, max 256.", collect_measurements, 2, 0),
++	SHELL_CMD_ARG(dump, NULL, "Command to print p1-th to p2-th readings.", dump_readings, 3, 0),
++	SHELL_CMD(clear, NULL, "Command to clear all readings in buffer.", clear_buffer),
++	SHELL_SUBCMD_SET_END /* Array terminated. */
++);
++SHELL_CMD_REGISTER(hcsr, &sub_hcsr, "HCSR04 Sensor commands", NULL);
++
++/* Main function */
++void main(void)
++{
++	//Disabling both devices initially
++	sensor_dev0 = NULL;	
++ 	sensor_dev1 = NULL;	
++
++ 	//Reference start time of application from which the elapsed time for each sample is measured
++ 	elapsed_start = rdtsc();
++
++	printk("CSE 522: RTES - HCSR04 App; All Devices are disabled\n");
++}
